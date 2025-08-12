@@ -1,0 +1,12 @@
+torch
+torchvision
+torchaudio
+streamlit
+streamlit-drawable-canvas
+numpy
+pandas
+scikit-learn
+matplotlib
+pillow
+tqdm
+pyyaml

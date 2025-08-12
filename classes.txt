@@ -1,0 +1,10 @@
+apple
+banana
+bicycle
+cat
+dog
+fish
+flower
+house
+moon
+tree
