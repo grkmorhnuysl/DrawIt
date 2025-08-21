@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Çiz ve Tahmin Et</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background:#fafafa; }
+    .wrap { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 20px; align-items: start; }
+    .card { background: #fff; border-radius: 14px; box-shadow: 0 6px 18px rgba(0,0,0,.06); padding: 16px; }
+    canvas { border: 2px solid #222; background: #fff; touch-action: none; border-radius: 8px; display:block; margin: 0 auto; }
+    .controls { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+    .controls button { padding: 8px 14px; border-radius: 10px; border: 0; background:#222; color:#fff; cursor:pointer; }
+    .controls input[type=range] { vertical-align: middle; }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    .topk h2 { margin: 0 0 10px; font-size: 18px; }
+    .bar { height: 10px; background: #e6e6e6; border-radius: 6px; overflow: hidden; }
+    .bar > div { height: 100%; background: #4a7dff; width: 0%; transition: width .15s linear; }
+    .row { display: grid; grid-template-columns: 1fr 52px; gap: 8px; align-items: center; margin: 8px 0; }
+    .muted { color:#666; font-size: 13px; }
+    .result { text-align:center; margin-top:10px; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Çiz ve Tahmin Et</h1>
+      <canvas id="canvas"></canvas>
+      <div class="controls">
+        <button id="clearBtn">Temizle</button>
+        <button id="predictBtn">Tahmin Et</button>
+        <label>Kalem:
+          <input id="size" type="range" min="2" max="40" value="10" />
+          <span id="sizeVal">10</span> px
+        </label>
+      </div>
+      <div id="final" class="result"></div>
+      <div class="muted" style="text-align:center;margin-top:6px;">Çizerken yan panel canlı güncellenir.</div>
+    </div>
+
+    <div class="card topk">
+      <h2>Model ne düşünüyor? (Canlı)</h2>
+      <div id="topk"></div>
+      <div class="muted">Her ~200 ms’de bir tahmin alınıyor. Ağ gecikmesinde eski cevaplar otomatik yok sayılır.</div>
+    </div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const sizeInput = document.getElementById('size');
+    const sizeVal = document.getElementById('sizeVal');
+    const topkEl = document.getElementById('topk');
+    const finalEl = document.getElementById('final');
+
+    // ----- Tuval ayarı (yüksek DPI) -----
+    const cssWidth = 512, cssHeight = 512;
+    function setupCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.style.width = cssWidth + 'px';
+      canvas.style.height = cssHeight + 'px';
+      canvas.width = Math.round(cssWidth * dpr);
+      canvas.height = Math.round(cssHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'black';
+      ctx.lineWidth = Number(sizeInput.value);
+      paintWhite();
+      ctx.beginPath();
+    }
+    function paintWhite() {
+      ctx.save();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = 'white';
+      ctx.fillRect(0, 0, cssWidth, cssHeight);
+      ctx.restore();
+    }
+    setupCanvas();
+
+    // Kalem slider
+    sizeInput.addEventListener('input', () => {
+      sizeVal.textContent = sizeInput.value;
+      ctx.lineWidth = Number(sizeInput.value);
+    });
+
+    // Çizim olayları
+    let drawing = false;
+    function getPos(e) {
+      const r = canvas.getBoundingClientRect();
+      if (e.touches && e.touches.length) return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    }
+    function startDraw(e) {
+      e.preventDefault();
+      drawing = true;
+      const {x,y} = getPos(e);
+      ctx.beginPath(); ctx.moveTo(x,y);
+      ensureLiveLoop(); // çizim başlar başlamaz canlı tahmin açık
+    }
+    function draw(e) {
+      if (!drawing) return;
+      e.preventDefault();
+      const {x,y} = getPos(e);
+      ctx.lineTo(x,y); ctx.stroke(); ctx.beginPath(); ctx.moveTo(x,y);
+    }
+    function endDraw(e) {
+      if (!drawing) return;
+      drawing = false;
+      // bir kez daha canlı tahmin al (stroke biter bitmez)
+      requestLivePrediction();
+    }
+
+    canvas.addEventListener('mousedown', startDraw);
+    canvas.addEventListener('mousemove', draw);
+    window.addEventListener('mouseup', endDraw);
+
+    canvas.addEventListener('touchstart', startDraw, {passive:false});
+    canvas.addEventListener('touchmove', draw, {passive:false});
+    canvas.addEventListener('touchend', endDraw, {passive:false});
+    canvas.addEventListener('touchcancel', endDraw, {passive:false});
+
+    // Temizle
+    document.getElementById('clearBtn').addEventListener('click', () => {
+      ctx.clearRect(0,0,cssWidth,cssHeight);
+      paintWhite();
+      ctx.beginPath();
+      topkEl.innerHTML = '';
+      finalEl.textContent = '';
+    });
+
+    // Tek seferlik tahmin
+    document.getElementById('predictBtn').addEventListener('click', async () => {
+      const res = await sendImage();
+      if (res) finalEl.textContent = "Tahmin: " + res.prediction;
+    });
+
+    // ----- Canlı tahmin döngüsü -----
+    let liveTimer = null;
+    let lastSent = 0;
+    const throttleMs = 200;
+    let inflightController = null;
+    let requestSeq = 0, lastHandledSeq = 0;
+
+    function ensureLiveLoop() {
+      if (liveTimer) return;
+      liveTimer = setInterval(() => {
+        if (!drawing) return;
+        requestLivePrediction();
+      }, throttleMs);
+    }
+    function stopLiveLoop() {
+      if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    }
+    window.addEventListener('blur', stopLiveLoop);
+
+    async function requestLivePrediction() {
+      const now = Date.now();
+      if (now - lastSent < throttleMs) return;
+      lastSent = now;
+      const seq = ++requestSeq;
+
+      // Eski isteği iptal et
+      if (inflightController) inflightController.abort();
+      inflightController = new AbortController();
+
+      try {
+        const res = await sendImage(inflightController.signal);
+        if (!res) return;
+        // Sıradan geri gelenleri at
+        if (seq < lastHandledSeq) return;
+        lastHandledSeq = seq;
+        renderTopK(res.top3);
+        finalEl.textContent = "Anlık tahmin: " + res.prediction;
+      } catch (err) {
+        if (err.name !== 'AbortError') console.error(err);
+      }
+    }
+
+    function renderTopK(items) {
+      if (!items || !items.length) { topkEl.innerHTML = ''; return; }
+      topkEl.innerHTML = '';
+      const maxp = Math.max(...items.map(i => i.prob));
+      items.forEach(it => {
+        const pct = Math.round((it.prob / (maxp || 1)) * 100);
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = `
+          <div><strong>${it.label}</strong>
+            <div class="bar"><div style="width:${Math.round(it.prob*100)}%"></div></div>
+          </div>
+          <div style="text-align:right">${(it.prob*100).toFixed(1)}%</div>
+        `;
+        topkEl.appendChild(row);
+      });
+    }
+
+    // Görseli gönder
+    async function sendImage(signal) {
+      const dataURL = canvas.toDataURL('image/png');
+      const res = await fetch('/predict?nocache=' + Date.now(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+        body: JSON.stringify({ image: dataURL }),
+        signal
+      });
+      if (!res.ok) return null;
+      return await res.json();
+    }
+  </script>
+</body>
+</html>
