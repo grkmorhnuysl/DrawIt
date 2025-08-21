@@ -8,10 +8,13 @@ from flask import Flask, render_template, jsonify, request
 from PIL import Image, ImageOps
 import torch.nn as nn
 from torchvision.models import resnet18
+from PIL import Image
+
 
 # ---------------------------------------------------
 # Proje kökü (src'den de çalışsa köke çıksın)
 # ---------------------------------------------------
+Image.MAX_IMAGE_PIXELS = 20_000_000  # max 20MP resim
 _THIS = Path(__file__).resolve()
 project_root = _THIS.parent.parent if _THIS.parent.name == "src" else _THIS.parent
 print("Project root:", project_root)
@@ -46,7 +49,7 @@ print("CKPT PATH:", ckpt_path)
 if not ckpt_path.exists():
     raise FileNotFoundError(f"Model dosyası bulunamadı: {ckpt_path}")
 
-ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
 classes = ckpt["classes"]
 model_type = ckpt.get("model_type", "smallcnn")
 img_size = int(ckpt.get("img_size", 28))
@@ -127,6 +130,21 @@ def index():
 
 @app.route("/predict", methods=["POST"])
 def predict():
+    body = request.get_json(silent=True) or {}
+    if "image" not in body or not isinstance(body["image"], str):
+        return jsonify(error="bad request"), 400
+    
+    try:
+        header, b64data = body["image"].split(",", 1)
+        raw = base64.b64decode(b64data, validate=True)
+    except Exception:
+        return jsonify(error="invalid image"), 400
+
+    # Boyut sınırı (örn. 1.5MB)
+    if len(raw) > 1_500_000:
+        return jsonify(error="file too large"), 413
+
+    img = Image.open(io.BytesIO(raw)).convert("L")
     data = request.json["image"]
     image_data = base64.b64decode(data.split(",")[1])
     pred, top3 = predict_topk(image_data, k=3)
